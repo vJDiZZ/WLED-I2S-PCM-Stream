@@ -2138,6 +2138,13 @@ class AudioReactive : public Usermod {
           if (audioSource) audioSource->initialize(i2swsPin, i2ssdPin, i2sckPin, mclkPin);
           break;
 
+        case 10:
+          DEBUGSR_PRINTLN(F("AR: I2S Slave Source (external master provides clocks)."));
+          audioSource = new I2SSlaveSource(SAMPLE_RATE, BLOCK_SIZE, 1.0f);
+          delay(100);
+          if (audioSource) audioSource->initialize(i2swsPin, i2ssdPin, i2sckPin);
+          break;
+
           case 255: // falls through
           case 254: // dummy "network receive only" driver
             if (audioSource) delete audioSource;
@@ -3106,6 +3113,11 @@ class AudioReactive : public Usermod {
         oappend(SET_F("addOption(dd,'ES8311 ☾ (⎌)',9);"));
       #else
         oappend(SET_F("addOption(dd,'ES8311 ☾',9);"));
+      #endif
+      #if SR_DMTYPE==10
+        oappend(SET_F("addOption(dd,'I2S Slave (⎌)',10);"));
+      #else
+        oappend(SET_F("addOption(dd,'I2S Slave',10);"));
       #endif
       #ifdef SR_SQUELCH
         oappend(SET_F("addInfo(ux+':config:squelch',1,'<i>&#9100; ")); oappendi(SR_SQUELCH); oappend("</i>');");  // 0 is field type, 1 is actual field

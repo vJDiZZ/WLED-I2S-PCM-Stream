@@ -1175,4 +1175,144 @@ class SPH0654 : public I2SSource {
 #endif
     }
 };
+
+/* I2S Slave Source - for receiving audio from an external I2S master device.
+   Use this when receiving audio from DACs, DSPs (like ADAU1701), or other
+   devices that generate their own BCLK and LRCLK signals.
+   The ESP32 will listen for clock signals from the external master device
+   and read audio data synchronized to those clocks.
+*/
+class I2SSlaveSource : public AudioSource {
+  public:
+    I2SSlaveSource(SRate_t sampleRate, int blockSize, float sampleScale = 1.0f) :
+      AudioSource(sampleRate, blockSize, sampleScale, false) {
+      _config = {
+        .mode = i2s_mode_t(I2S_MODE_SLAVE | I2S_MODE_RX),
+        .sample_rate = _sampleRate,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,       // stereo - we read both channels and pick left
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 2, 0)
+        .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL2,
+        .dma_buf_count = 8,
+        .dma_buf_len = _blockSize * 2,                       // *2 for stereo
+        .use_apll = false,                                   // APLL not used in slave mode
+        .bits_per_chan = I2S_BITS_PER_CHAN_32BIT,
+#else
+        .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 8,
+        .dma_buf_len = _blockSize * 2,
+        .use_apll = false
+#endif
+      };
+    }
+
+    void initialize(int8_t i2swsPin = I2S_PIN_NO_CHANGE, int8_t i2ssdPin = I2S_PIN_NO_CHANGE, int8_t i2sckPin = I2S_PIN_NO_CHANGE, int8_t mclkPin = I2S_PIN_NO_CHANGE) override {
+      DEBUGSR_PRINTLN(F("I2SSlaveSource:: initialize(). Slave mode - expecting external I2S master."));
+
+      if (i2swsPin == I2S_PIN_NO_CHANGE || i2ssdPin == I2S_PIN_NO_CHANGE || i2sckPin == I2S_PIN_NO_CHANGE) {
+        ERRORSR_PRINTLN(F("AR: I2S Slave mode requires WS, SD, and SCK pins to be defined!"));
+        return;
+      }
+
+      // Configure pins as high-impedance inputs BEFORE I2S driver init
+      // to prevent the ESP32 from interfering with the I2S bus during initialization
+      pinMode(i2swsPin, INPUT);
+      pinMode(i2ssdPin, INPUT);
+      pinMode(i2sckPin, INPUT);
+      DEBUGSR_PRINTLN(F("AR: I2S Slave pins pre-configured as high-impedance inputs."));
+
+      // In slave mode, WS and SCK are inputs (driven by external master)
+      if (!pinManager.allocatePin(i2swsPin, false, PinOwner::UM_Audioreactive) ||
+          !pinManager.allocatePin(i2ssdPin, false, PinOwner::UM_Audioreactive) ||
+          !pinManager.allocatePin(i2sckPin, false, PinOwner::UM_Audioreactive)) {
+        ERRORSR_PRINTF("\nAR: Failed to allocate I2S Slave pins: ws=%d, sd=%d, sck=%d\n", i2swsPin, i2ssdPin, i2sckPin);
+        return;
+      }
+
+      _pinConfig = {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
+        .mck_io_num = I2S_PIN_NO_CHANGE,
+#endif
+        .bck_io_num = i2sckPin,
+        .ws_io_num = i2swsPin,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = i2ssdPin
+      };
+
+      esp_err_t err = i2s_driver_install(AR_I2S_PORT, &_config, 0, nullptr);
+      if (err != ESP_OK) {
+        ERRORSR_PRINTF("AR: Failed to install I2S slave driver: %d\n", err);
+        return;
+      }
+
+      DEBUGSR_PRINTLN(F("AR: I2S#0 driver installed in SLAVE mode."));
+      DEBUGSR_PRINTF("AR: Nominal sample rate: %d Hz, %d bits\n", _sampleRate, _config.bits_per_sample);
+      DEBUGSR_PRINTLN(F("AR: Actual sample rate determined by external I2S master device."));
+
+      err = i2s_set_pin(AR_I2S_PORT, &_pinConfig);
+      if (err != ESP_OK) {
+        ERRORSR_PRINTF("AR: Failed to set I2S slave pin config: %d\n", err);
+        i2s_driver_uninstall(AR_I2S_PORT);
+        return;
+      }
+
+      _initialized = true;
+      DEBUGSR_PRINTLN(F("AR: I2S Slave source initialized. Waiting for external clock signals..."));
+    }
+
+    void deinitialize() override {
+      _initialized = false;
+      esp_err_t err = i2s_driver_uninstall(AR_I2S_PORT);
+      if (err != ESP_OK) {
+        DEBUGSR_PRINTF("Failed to uninstall I2S slave driver: %d\n", err);
+        return;
+      }
+      if (_pinConfig.ws_io_num   != I2S_PIN_NO_CHANGE) pinManager.deallocatePin(_pinConfig.ws_io_num,   PinOwner::UM_Audioreactive);
+      if (_pinConfig.data_in_num != I2S_PIN_NO_CHANGE) pinManager.deallocatePin(_pinConfig.data_in_num, PinOwner::UM_Audioreactive);
+      if (_pinConfig.bck_io_num  != I2S_PIN_NO_CHANGE) pinManager.deallocatePin(_pinConfig.bck_io_num,  PinOwner::UM_Audioreactive);
+    }
+
+    void getSamples(float *buffer, uint16_t num_samples) override {
+      if (!_initialized) {
+        memset(buffer, 0, num_samples * sizeof(float));
+        return;
+      }
+
+      esp_err_t err;
+      size_t bytes_read = 0;
+
+      // Read stereo 32-bit samples (left + right interleaved)
+      // Limit to half of I2S_SAMPLES_MAX since we read stereo pairs
+      if (num_samples > I2S_SAMPLES_MAX / 2) num_samples = I2S_SAMPLES_MAX / 2;
+      const size_t bytesToRead = num_samples * 2 * sizeof(int32_t);  // *2 for stereo
+
+      // Use 100ms timeout instead of blocking forever
+      err = i2s_read(AR_I2S_PORT, (void *)_stereoBuffer, bytesToRead, &bytes_read, pdMS_TO_TICKS(100));
+
+      if (err != ESP_OK || bytes_read == 0) {
+        memset(buffer, 0, num_samples * sizeof(float));
+        return;
+      }
+
+      int samplesRead = bytes_read / (sizeof(int32_t) * 2);  // stereo pairs actually read
+
+      // Extract left channel from interleaved stereo and normalize
+      for (int i = 0; i < num_samples; i++) {
+        if (i < samplesRead) {
+          int32_t leftSample = _stereoBuffer[i * 2];
+          // Normalize 32-bit to 16-bit range, matching I2S_SAMPLE_DOWNSCALE_TO_16BIT convention
+          buffer[i] = ((float)leftSample / 65536.0f) * _sampleScale;
+        } else {
+          buffer[i] = 0.0f;
+        }
+      }
+    }
+
+  protected:
+    i2s_config_t _config;
+    i2s_pin_config_t _pinConfig;
+    int32_t _stereoBuffer[I2S_SAMPLES_MAX * 2] = { 0 };  // stereo buffer for i2s_read
+};
 #endif
